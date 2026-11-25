@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, HashSet};
 
 #[derive(Debug, Clone, Copy)]
 pub struct Neighbor {
@@ -68,8 +68,21 @@ impl TopK {
     }
 }
 
-pub fn recall_at_k(_expected: &[Neighbor], _actual: &[Neighbor], _k: usize) -> f64 {
-    todo!("Day 2: compute top-k row-offset overlap")
+pub fn recall_at_k(expected: &[Neighbor], actual: &[Neighbor], k: usize) -> f64 {
+    let expected = expected
+        .iter()
+        .take(k)
+        .map(|neighbor| neighbor.row)
+        .collect::<HashSet<_>>();
+    if expected.is_empty() {
+        return 1.0;
+    }
+    let actual = actual
+        .iter()
+        .take(k)
+        .map(|neighbor| neighbor.row)
+        .collect::<HashSet<_>>();
+    expected.intersection(&actual).count() as f64 / expected.len() as f64
 }
 
 #[derive(Debug, Clone)]

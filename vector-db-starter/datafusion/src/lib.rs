@@ -254,10 +254,13 @@ impl VectorIndexAttachment {
             indexed_rows: {
                 let mut batches = vec![];
                 let mut row_locations = Vec::new();
-                for (id, partition_data) in partitions.iter().enumerate() {
-                    for (row, record_batch) in partition_data.iter().enumerate() {
+                for partition_data in partitions.iter() {
+                    for record_batch in partition_data.iter() {
+                        let batch = batches.len();
                         batches.push(record_batch.clone());
-                        row_locations.push(RowLocation { batch: id, row });
+                        for row in 0..record_batch.num_rows() {
+                            row_locations.push(RowLocation { batch, row });
+                        }
                     }
                 }
                 let indexed_snapshot = IndexedSnapshot {
@@ -406,9 +409,6 @@ impl VectorIndexOptimizer {
         if sort.expr().len() != 1 {
             return Ok(Transformed::no(plan));
         }
-        if sort.expr()[0].options.descending {
-            return Ok(Transformed::no(plan));
-        }
 
         let Some(fetch) = sort.fetch() else {
             // 全量排序用不到索引
@@ -421,21 +421,48 @@ impl VectorIndexOptimizer {
             return Ok(Transformed::no(plan));
         };
         let scan_schema = sort.input().schema();
-        let mut is_ok = None;
-        for (idx, attachment) in self.attachments.iter().enumerate() {
-            let live_table_matches = attachment.live_table_matches(memory);
-            let source_matches = attachment.source_matches(memory, &scan_schema);
-            if live_table_matches && source_matches {
-                is_ok = Some(idx);
-                break;
-            }
-        }
-        if is_ok.is_none() {
+        let Some(idx) = self.attachments.iter().position(|attachment| {
+            attachment.live_table_matches(memory) && attachment.source_matches(memory, &scan_schema)
+        }) else {
             return Ok(Transformed::no(plan));
-        }
-        let ordering = sort.expr();
+        };
+        let attachment = &self.attachments[idx];
 
-        todo!("Day 1: replace only a matching MemTable top-k sort with the attached vector index")
+        let ordered = config
+            .extensions
+            .get::<VectorSearchOptions>()
+            .map(|o| o.ordered)
+            .unwrap_or(false);
+
+        let Some(query) = match_vector_order(
+            sort.expr(),
+            &scan_schema,
+            attachment.snapshot.index.as_ref(),
+            &attachment.snapshot.vector_column,
+        ) else {
+            return Ok(Transformed::no(plan));
+        };
+
+        let projection = memory.projection().clone();
+        let ordering = sort.expr().to_vec();
+        let scan = VectorIndexScanExec::try_new(
+            attachment.snapshot.clone(),
+            projection,
+            fetch,
+            Arc::from(query),
+            ordered,
+            ordering,
+        )?;
+        let scan = Arc::new(scan) as Arc<dyn ExecutionPlan>;
+
+        if ordered {
+            return Ok(Transformed::yes(scan));
+        }
+
+        // Default (safe) path: keep DataFusion's final sort around the index scan.
+        let sort_expr = sort.expr().clone();
+        let new_sort = SortExec::new(sort_expr, scan).with_fetch(Some(fetch));
+        Ok(Transformed::yes(Arc::new(new_sort)))
     }
 }
 
@@ -578,7 +605,10 @@ impl VectorIndexScanExec {
             ));
         }
         let projected_schema = project_schema(&snapshot.indexed_rows.schema, projection.as_ref())?;
-        let properties = compute_properties(&projected_schema, Some(&ordering));
+        // Only an ordered scan may expose its accepted ordering property; the
+        // default path leaves SQL's final sort to DataFusion above the scan.
+        let claimed_ordering = ordered.then_some(ordering.as_slice());
+        let properties = compute_properties(&projected_schema, claimed_ordering);
         Ok(Self {
             snapshot,
             projection,
@@ -592,7 +622,24 @@ impl VectorIndexScanExec {
     }
 
     fn selected_rows(&self) -> DataFusionResult<Vec<RowId>> {
-        todo!("Day 1: search the selected index and validate every returned snapshot row id")
+        let neighbors = self
+            .snapshot
+            .index
+            .search(&self.query, self.fetch)
+            .map_err(core_error)?;
+        let locations = &self.snapshot.indexed_rows.row_locations;
+        let mut rows = Vec::with_capacity(neighbors.len());
+        for neighbor in neighbors {
+            if neighbor.row >= locations.len() {
+                return Err(DataFusionError::Internal(format!(
+                    "vector index returned unknown dataset row {} for a snapshot of {} rows",
+                    neighbor.row,
+                    locations.len()
+                )));
+            }
+            rows.push(RowId(neighbor.row));
+        }
+        Ok(rows)
     }
 
     fn output_batch(&self, rows: &[RowId]) -> DataFusionResult<RecordBatch> {
@@ -664,8 +711,24 @@ impl ExecutionPlan for VectorIndexScanExec {
         )?))
     }
 
-    fn with_fetch(&self, _fetch: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
-        todo!("Day 1: preserve DataFusion's final sort unless ordered index output is enabled")
+    fn with_fetch(&self, fetch: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
+        // Absorbing a pushed limit is safe only when the scan itself returns
+        // rows in SQL order. Otherwise DataFusion must keep its final bounded
+        // sort above the scan and own the nearest-first result.
+        if !self.ordered {
+            return None;
+        }
+        let fetch = fetch?;
+        let scan = Self::try_new(
+            Arc::clone(&self.snapshot),
+            self.projection.clone(),
+            fetch,
+            Arc::clone(&self.query),
+            self.ordered,
+            self.ordering.clone(),
+        )
+        .ok()?;
+        Some(Arc::new(scan))
     }
 
     fn fetch(&self) -> Option<usize> {

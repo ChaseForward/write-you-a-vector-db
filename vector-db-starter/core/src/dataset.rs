@@ -87,7 +87,7 @@ impl Dataset {
         for i in 0..len {
             if !f32::is_finite(query[i]) {
                 return Err(VectorError::NonFiniteValue {
-                    vector: len,
+                    vector: self.len(),
                     dimension: i,
                 });
             }
@@ -95,7 +95,7 @@ impl Dataset {
         match metric {
             Metric::Cosine => {
                 if query.iter().all(|&x| x == 0.0) {
-                    return Err(VectorError::ZeroNorm { vector: len });
+                    return Err(VectorError::ZeroNorm { vector: self.len()});
                 }
             }
             Metric::Dot => {}
